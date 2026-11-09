@@ -4,3 +4,4 @@
 .dev.vars
 wrangler.local.toml
 *.log
+.stats_token

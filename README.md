@@ -22,6 +22,10 @@ analytics service, no cookies, no third party seeing your visitors.
   is never counted again (`?nocount=0` re-enables counting).
 - **SVG badge**: `GET /badge.svg` renders your total pageview count,
   shields.io style, ready to embed anywhere.
+- **Owner stats**: `GET /stats?days=7` returns daily totals, per-path and
+  per-referrer rankings, and the most recent views as JSON. It is guarded by a
+  bearer token in the `STATS_TOKEN` secret (`wrangler secret put STATS_TOKEN`);
+  when the secret is not set, the endpoint answers 503 and stays disabled.
 - **Daily rollup**: a `daily_stats` table is maintained next to the raw
   events, so reports are cheap SQL queries.
 - Runs entirely within Cloudflare's free tier for typical personal-site

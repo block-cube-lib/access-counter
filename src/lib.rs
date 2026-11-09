@@ -54,6 +54,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (worker::Method::Post, "/count") => handle_count(req, env).await,
         (worker::Method::Options, "/count") => handle_preflight(req, env),
         (worker::Method::Get, "/badge.svg") => handle_badge(env).await,
+        (worker::Method::Get, "/stats") => handle_stats(req, env).await,
         (worker::Method::Get, "/") => {
             Response::ok("access-counter is running. POST /count, GET /badge.svg\n")
         }
@@ -271,6 +272,193 @@ async fn handle_count(mut req: Request, env: Env) -> Result<Response> {
     db.batch(vec![stmt_events, stmt_daily]).await?;
 
     Ok(Response::empty()?.with_headers(headers).with_status(204))
+}
+
+/// Inverse of `civil_from_days` (Howard Hinnant's algorithm, public domain).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = (y_adj - era * 400) as u64; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + (d as u64 - 1); // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
+}
+
+fn parse_date(s: &str) -> Option<(i64, u32, u32)> {
+    let mut parts = s.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    Some((y, m, d))
+}
+
+/// The local date `n` days before `date` (both "YYYY-MM-DD").
+fn date_minus(date: &str, n: i64) -> Option<String> {
+    let (y, m, d) = parse_date(date)?;
+    let days = days_from_civil(y, m, d) - n;
+    let (yy, mm, dd) = civil_from_days(days);
+    Some(format!("{yy:04}-{mm:02}-{dd:02}"))
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[derive(Deserialize)]
+struct DailyRow {
+    jst_date: String,
+    views: f64,
+}
+
+#[derive(Deserialize)]
+struct PathRow {
+    path: String,
+    views: f64,
+}
+
+#[derive(Deserialize)]
+struct ReferrerRow {
+    referrer: String,
+    views: f64,
+}
+
+#[derive(Deserialize)]
+struct RecentRow {
+    ts: f64,
+    path: String,
+    referrer: Option<String>,
+    ua_class: Option<String>,
+    country: Option<String>,
+}
+
+/// Read-only stats for the site owner, as JSON. Guarded by a bearer token
+/// stored in the `STATS_TOKEN` secret; when the secret is not configured the
+/// endpoint is disabled (503) rather than open. Only aggregates from
+/// `daily_stats` plus referrer / recent rows from `events` are exposed — the
+/// same data the beacon already collected, nothing more.
+async fn handle_stats(req: Request, env: Env) -> Result<Response> {
+    let expected = match env.secret("STATS_TOKEN") {
+        Ok(v) => v.to_string(),
+        Err(_) => return Response::error("stats not configured", 503),
+    };
+    let presented = req
+        .headers()
+        .get("authorization")
+        .ok()
+        .flatten()
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    match presented {
+        Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => {}
+        _ => return Response::error("unauthorized", 401),
+    }
+
+    let days: i64 = req
+        .url()
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "days")
+                .and_then(|(_, v)| v.parse::<i64>().ok())
+        })
+        .unwrap_or(7)
+        .clamp(1, 90);
+
+    let now = (worker::Date::now().as_millis() / 1000) as i64;
+    let today = local_date(now, tz_offset_minutes(&env));
+    let start = date_minus(&today, days - 1).unwrap_or_else(|| today.clone());
+
+    let db = env.d1("DB")?;
+
+    let daily_rows = db
+        .prepare(
+            "SELECT jst_date, SUM(views) AS views FROM daily_stats \
+             WHERE jst_date >= ?1 GROUP BY jst_date",
+        )
+        .bind(&[JsValue::from_str(&start)])?
+        .all()
+        .await?
+        .results::<DailyRow>()?;
+    let mut by_date: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for row in &daily_rows {
+        by_date.insert(row.jst_date.clone(), row.views.max(0.0) as u64);
+    }
+    let mut daily = Vec::new();
+    let mut total_views: u64 = 0;
+    for back in (0..days).rev() {
+        let date = date_minus(&today, back).unwrap_or_else(|| today.clone());
+        let views = by_date.get(&date).copied().unwrap_or(0);
+        total_views += views;
+        daily.push(serde_json::json!({ "date": date, "views": views }));
+    }
+    let today_views = by_date.get(&today).copied().unwrap_or(0);
+
+    let path_rows = db
+        .prepare(
+            "SELECT path, SUM(views) AS views FROM daily_stats \
+             WHERE jst_date >= ?1 GROUP BY path ORDER BY views DESC LIMIT 50",
+        )
+        .bind(&[JsValue::from_str(&start)])?
+        .all()
+        .await?
+        .results::<PathRow>()?;
+
+    let referrer_rows = db
+        .prepare(
+            "SELECT COALESCE(referrer, '(direct)') AS referrer, COUNT(*) AS views \
+             FROM events WHERE jst_date >= ?1 \
+             GROUP BY referrer ORDER BY views DESC LIMIT 20",
+        )
+        .bind(&[JsValue::from_str(&start)])?
+        .all()
+        .await?
+        .results::<ReferrerRow>()?;
+
+    let recent_rows = db
+        .prepare(
+            "SELECT ts, path, referrer, ua_class, country FROM events \
+             ORDER BY ts DESC LIMIT 20",
+        )
+        .all()
+        .await?
+        .results::<RecentRow>()?;
+
+    let payload = serde_json::json!({
+        "today": today,
+        "days": days,
+        "total_views": total_views,
+        "today_views": today_views,
+        "daily": daily,
+        "paths": path_rows
+            .iter()
+            .map(|r| serde_json::json!({ "path": r.path, "views": r.views.max(0.0) as u64 }))
+            .collect::<Vec<_>>(),
+        "referrers": referrer_rows
+            .iter()
+            .map(|r| serde_json::json!({ "referrer": r.referrer, "views": r.views.max(0.0) as u64 }))
+            .collect::<Vec<_>>(),
+        "recent": recent_rows
+            .iter()
+            .map(|r| serde_json::json!({
+                "ts": r.ts as i64,
+                "path": r.path,
+                "referrer": r.referrer,
+                "ua_class": r.ua_class,
+                "country": r.country,
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    let headers = Headers::new();
+    headers.set("Cache-Control", "no-store")?;
+    Ok(Response::from_json(&payload)?.with_headers(headers))
 }
 
 async fn handle_badge(env: Env) -> Result<Response> {
