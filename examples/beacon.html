@@ -3,13 +3,14 @@
 <script>
 (function () {
   var ENDPOINT = "https://access-counter.YOUR-SUBDOMAIN.workers.dev/count";
+  var params = new URLSearchParams(location.search);
+  if (params.get("nocount") === "1") {
+    // Visit any page once with ?nocount=1 to exclude this browser.
+    // Honored even when localStorage is unavailable: never count this visit.
+    try { localStorage.setItem("ac-nocount", "1"); } catch (e) {}
+    return;
+  }
   try {
-    var params = new URLSearchParams(location.search);
-    if (params.get("nocount") === "1") {
-      // Visit any page once with ?nocount=1 to exclude this browser.
-      localStorage.setItem("ac-nocount", "1");
-      return;
-    }
     if (params.get("nocount") === "0") {
       localStorage.removeItem("ac-nocount");
     }

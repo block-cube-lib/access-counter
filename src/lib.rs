@@ -84,8 +84,13 @@ fn origin_allowed(req: &Request, allowed: &[String]) -> Option<String> {
         }
     }
     if let Ok(Some(referer)) = req.headers().get("referer") {
-        if let Some(a) = allowed.iter().find(|a| referer.starts_with(a.as_str())) {
-            return Some((*a).clone());
+        // Compare the referer's *origin* exactly — a prefix match would let
+        // "https://example.com.evil.tld" pass for "https://example.com".
+        if let Ok(url) = worker::Url::parse(&referer) {
+            let origin = url.origin().ascii_serialization();
+            if allowed.iter().any(|a| a == &origin) {
+                return Some(origin);
+            }
         }
     }
     None
@@ -106,13 +111,13 @@ fn is_bot(ua: &str) -> bool {
 /// Map a user-agent string to a coarse "Browser / OS" class.
 /// The raw string is never stored.
 fn ua_class(ua: &str) -> String {
-    let browser = if ua.contains("Edg/") {
+    let browser = if ua.contains("Edg/") || ua.contains("EdgA/") || ua.contains("EdgiOS/") {
         "Edge"
-    } else if ua.contains("OPR/") || ua.contains("Opera") {
+    } else if ua.contains("OPR/") || ua.contains("Opera") || ua.contains("OPiOS/") {
         "Opera"
     } else if ua.contains("SamsungBrowser") {
         "Samsung Internet"
-    } else if ua.contains("Firefox/") {
+    } else if ua.contains("Firefox/") || ua.contains("FxiOS/") {
         "Firefox"
     } else if ua.contains("Chrome/") || ua.contains("CriOS") {
         "Chrome"
@@ -181,6 +186,7 @@ fn cors_headers(origin: Option<String>) -> Result<Headers> {
     if let Some(o) = origin {
         headers.set("Access-Control-Allow-Origin", &o)?;
     }
+    headers.set("Vary", "Origin")?;
     Ok(headers)
 }
 
@@ -208,12 +214,24 @@ async fn handle_count(mut req: Request, env: Env) -> Result<Response> {
         return Ok(Response::empty()?.with_headers(headers).with_status(204));
     }
 
+    // Beacons are tiny; refuse oversized bodies instead of buffering them.
+    if let Ok(Some(len)) = req.headers().get("content-length") {
+        if len.parse::<usize>().map_or(false, |n| n > 4096) {
+            return Ok(Response::empty()?.with_headers(headers).with_status(204));
+        }
+    }
     let body = req.text().await.unwrap_or_default();
+    if body.len() > 4096 {
+        return Ok(Response::empty()?.with_headers(headers).with_status(204));
+    }
     let beacon: Beacon = match serde_json::from_str(&body) {
         Ok(b) => b,
         Err(_) => return Ok(Response::empty()?.with_headers(headers).with_status(204)),
     };
-    if !beacon.p.starts_with('/') || beacon.p.len() > 512 {
+    if !beacon.p.starts_with('/')
+        || beacon.p.len() > 512
+        || beacon.p.contains(|c: char| c == '?' || c == '#' || c.is_control())
+    {
         return Ok(Response::empty()?.with_headers(headers).with_status(204));
     }
 
@@ -224,33 +242,32 @@ async fn handle_count(mut req: Request, env: Env) -> Result<Response> {
     let country = req.cf().and_then(|cf| cf.country());
 
     let db = env.d1("DB")?;
-    db.prepare(
-        "INSERT INTO events (ts, jst_date, path, referrer, ua_class, country) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    )
-    .bind(&[
-        JsValue::from_f64(ts as f64),
-        JsValue::from_str(&date),
-        JsValue::from_str(&beacon.p),
-        match &referrer {
-            Some(r) => JsValue::from_str(r),
-            None => JsValue::NULL,
-        },
-        JsValue::from_str(&ua_class),
-        match &country {
-            Some(c) => JsValue::from_str(c),
-            None => JsValue::NULL,
-        },
-    ])?
-    .run()
-    .await?;
-
-    db.prepare(
-        "INSERT INTO daily_stats (jst_date, path, views) VALUES (?1, ?2, 1) \
-         ON CONFLICT (jst_date, path) DO UPDATE SET views = views + 1",
-    )
-    .bind(&[JsValue::from_str(&date), JsValue::from_str(&beacon.p)])?
-    .run()
-    .await?;
+    let stmt_events = db
+        .prepare(
+            "INSERT INTO events (ts, jst_date, path, referrer, ua_class, country) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&[
+            JsValue::from_f64(ts as f64),
+            JsValue::from_str(&date),
+            JsValue::from_str(&beacon.p),
+            match &referrer {
+                Some(r) => JsValue::from_str(r),
+                None => JsValue::NULL,
+            },
+            JsValue::from_str(&ua_class),
+            match &country {
+                Some(c) => JsValue::from_str(c),
+                None => JsValue::NULL,
+            },
+        ])?;
+    let stmt_daily = db
+        .prepare(
+            "INSERT INTO daily_stats (jst_date, path, views) VALUES (?1, ?2, 1) \
+             ON CONFLICT (jst_date, path) DO UPDATE SET views = views + 1",
+        )
+        .bind(&[JsValue::from_str(&date), JsValue::from_str(&beacon.p)])?;
+    // One batch = one transaction, so events and the rollup cannot drift apart.
+    db.batch(vec![stmt_events, stmt_daily]).await?;
 
     Ok(Response::empty()?.with_headers(headers).with_status(204))
 }
@@ -266,7 +283,7 @@ async fn handle_badge(env: Env) -> Result<Response> {
         .await?
         .map(|row| row.total)
         .unwrap_or(0.0);
-    let total = total as u64;
+    let total = total.max(0.0) as u64;
 
     let digits = total.to_string();
     // shields.io-style badge: dark label segment + blue value segment.
@@ -290,5 +307,6 @@ async fn handle_badge(env: Env) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", "image/svg+xml")?;
     headers.set("Cache-Control", "public, max-age=60")?;
+    headers.set("Cross-Origin-Resource-Policy", "cross-origin")?;
     Ok(Response::ok(svg)?.with_headers(headers))
 }
