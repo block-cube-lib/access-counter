@@ -215,8 +215,9 @@ async fn handle_count(mut req: Request, env: Env) -> Result<Response> {
     }
 
     // Beacons are tiny; refuse oversized bodies instead of buffering them.
+    // Fail closed: an unparsable Content-Length drops the request too.
     if let Ok(Some(len)) = req.headers().get("content-length") {
-        if len.parse::<usize>().map_or(false, |n| n > 4096) {
+        if len.parse::<usize>().map_or(true, |n| n > 4096) {
             return Ok(Response::empty()?.with_headers(headers).with_status(204));
         }
     }
