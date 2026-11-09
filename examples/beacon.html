@@ -1,0 +1,44 @@
+<!-- access-counter beacon: paste before </body> on every page you want counted.
+     Replace the ENDPOINT with your own worker's /count URL. -->
+<script>
+(function () {
+  var ENDPOINT = "https://access-counter.YOUR-SUBDOMAIN.workers.dev/count";
+  try {
+    var params = new URLSearchParams(location.search);
+    if (params.get("nocount") === "1") {
+      // Visit any page once with ?nocount=1 to exclude this browser.
+      localStorage.setItem("ac-nocount", "1");
+      return;
+    }
+    if (params.get("nocount") === "0") {
+      localStorage.removeItem("ac-nocount");
+    }
+    if (localStorage.getItem("ac-nocount") === "1") return;
+  } catch (e) { /* storage unavailable: count anyway */ }
+
+  var sent = false;
+  function send() {
+    if (sent) return;
+    sent = true;
+    var payload = JSON.stringify({ p: location.pathname, r: document.referrer || "" });
+    if (navigator.sendBeacon) {
+      // text/plain keeps this a CORS-simple request (no preflight).
+      navigator.sendBeacon(ENDPOINT, new Blob([payload], { type: "text/plain" }));
+    } else {
+      fetch(ENDPOINT, {
+        method: "POST",
+        body: payload,
+        headers: { "Content-Type": "text/plain" },
+        keepalive: true
+      }).catch(function () {});
+    }
+  }
+
+  if (document.prerendering) {
+    // Do not count speculative prerenders; count only if actually shown.
+    document.addEventListener("prerenderingchange", send, { once: true });
+  } else {
+    send();
+  }
+})();
+</script>

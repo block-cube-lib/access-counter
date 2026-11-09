@@ -1,0 +1,21 @@
+name = "access-counter"
+main = "build/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[build]
+command = "worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "access-counter"
+# Replace with the id of your own D1 database (`wrangler d1 create access-counter`).
+database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
+migrations_dir = "migrations"
+
+[vars]
+# Comma-separated list of origins allowed to send beacons (your site).
+# Leave empty to accept beacons from any origin (not recommended in production).
+ALLOWED_ORIGINS = "https://example.com"
+# Timezone offset from UTC in minutes, used for the daily rollup (540 = JST, UTC+9).
+TZ_OFFSET_MINUTES = "540"
